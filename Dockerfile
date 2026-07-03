@@ -1,16 +1,20 @@
 FROM php:8.2-fpm-alpine
 
 # Install system dependencies & PostgreSQL driver
-RUN apk add --no-cache nginx wget postgresql-dev \
+RUN apk add --no-cache nginx wget postgresql-dev supervisor \
     && docker-php-ext-install pdo pdo_pgsql
 
-# Copy aplikasi
+# Copy semua file aplikasi
 COPY . /app
-RUN chown -R www-data:www-data /app
-
-# Setup Nginx & Workdir
 WORKDIR /app
-RUN ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
 
-# Jalankan skrip startup
-ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
+# Atur permission untuk Laravel
+RUN chown -R www-data:www-data /app \
+    && chmod -R 755 /app/storage
+
+# Copy konfigurasi Nginx khusus untuk Cloud Run
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Jalankan startup script
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
