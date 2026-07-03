@@ -1,24 +1,33 @@
-FROM php:8.2-fpm-alpine
+# 1. Gunakan PHP 8.4 karena Laravel & Symfony terbaru membutuhkan versi ini
+FROM php:8.4-fpm-alpine
 
-# 1. Install system dependencies, PostgreSQL driver, & Composer
-RUN apk add --no-cache nginx wget postgresql-dev supervisor git \
-    && docker-php-ext-install pdo pdo_pgsql \
+# 2. Install package OS dasar & dependensi ekstensi (icu-dev untuk intl, libzip-dev untuk zip)
+RUN apk add --no-cache \
+    nginx \
+    wget \
+    postgresql-dev \
+    supervisor \
+    git \
+    icu-dev \
+    libzip-dev \
+    && docker-php-ext-configure intl \
+    && docker-php-ext-install pdo pdo_pgsql intl zip \
     && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# 2. Set working directory
+# 3. Set direktori kerja dan salin seluruh source code
 COPY . /app
 WORKDIR /app
 
-# 3. Jalankan Composer Install untuk membuat folder vendor
+# 4. Jalankan Composer Install (Sekarang platform environment sudah memenuhi semua kriteria)
 RUN composer install --no-dev --optimize-autoloader --no-interaction
 
-# 4. Atur permission untuk Laravel agar tidak Access Denied
+# 5. Atur kepemilikan folder sesuai kebutuhan runtime web server
 RUN chown -R www-data:www-data /app \
     && chmod -R 775 /app/storage /app/bootstrap/cache
 
-# 5. Copy konfigurasi Nginx & Supervisor
+# 6. Salin konfigurasi Nginx dan Supervisor
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY supervisord.conf /etc/supervisord.conf
 
-# 6. Jalankan via Supervisor
+# 7. Eksekusi Supervisor sebagai entri utama
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
