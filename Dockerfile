@@ -12,9 +12,9 @@ WORKDIR /app
 RUN chown -R www-data:www-data /app \
     && chmod -R 755 /app/storage
 
-# Copy konfigurasi Nginx khusus untuk Cloud Run
+# Copy konfigurasi Nginx & Supervisor
 COPY nginx.conf /etc/nginx/nginx.conf
+COPY supervisord.conf /etc/supervisord.conf
 
-# Jalankan startup script
-RUN chmod +x /app/docker-entrypoint.sh
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+# Jalankan langsung via Supervisor (Tanpa file .sh)
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
