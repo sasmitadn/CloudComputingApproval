@@ -1,0 +1,306 @@
+<?php
+
+namespace App\Filament\Resources;
+
+use App\Events\DocumentStatusChanged;
+use App\Filament\Resources\DocumentResource\Pages;
+use App\Models\ApprovalTrack;
+use App\Models\Document;
+use App\Models\User;
+use Filament\Forms;
+use Filament\Forms\Form;
+use Filament\Icons\Heroicon;
+use Filament\Resources\Resource;
+use Filament\Tables;
+use Filament\Tables\Actions\Action;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\SoftDeletingScope;
+
+class DocumentResource extends Resource
+{
+    protected static ?string $model = Document::class;
+
+    protected static string|\BackedEnum|null $navigationIcon = 'heroicon-o-document-text';
+
+    public static function form(Form $form): Form
+    {
+        return $form
+            ->schema([
+                Forms\Components\TextInput::make('title')
+                    ->required()
+                    ->maxLength(255),
+                Forms\Components\Textarea::make('description')
+                    ->columnSpanFull(),
+                Forms\Components\FileUpload::make('file_path')
+                    ->disk('gcs')
+                    ->directory('documents')
+                    ->required(),
+                Forms\Components\Select::make('flow_type')
+                    ->options([
+                        Document::FLOW_TYPE_TEMPLATE => 'Template (Sequential)',
+                        Document::FLOW_TYPE_CUSTOM => 'Custom (Parallel)',
+                    ])
+                    ->required()
+                    ->live()
+                    ->default(Document::FLOW_TYPE_TEMPLATE),
+                Forms\Components\Select::make('approver_ids')
+                    ->label('Approvers (Custom Flow)')
+                    ->multiple()
+                    ->options(fn () => User::where('role', User::ROLE_APPROVER)->pluck('name', 'id'))
+                    ->visible(fn (Forms\Get $get) => $get('flow_type') === Document::FLOW_TYPE_CUSTOM)
+                    ->required(fn (Forms\Get $get) => $get('flow_type') === Document::FLOW_TYPE_CUSTOM),
+            ]);
+    }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                Tables\Columns\TextColumn::make('title')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('creator.name')
+                    ->label('Created By')
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('flow_type')
+                    ->badge()
+                    ->formatStateUsing(fn (string $state) => match ($state) {
+                        Document::FLOW_TYPE_TEMPLATE => 'Template',
+                        Document::FLOW_TYPE_CUSTOM => 'Custom',
+                        default => $state,
+                    }),
+                Tables\Columns\TextColumn::make('current_stage')
+                    ->badge()
+                    ->colors([
+                        'warning' => in_array(
+                            fn (string $state) => $state,
+                            [Document::STAGE_PENDING_MANAGER, Document::STAGE_PENDING_HR, Document::STAGE_PENDING_APPROVERS]
+                        ),
+                        'success' => Document::STAGE_APPROVED,
+                        'danger' => Document::STAGE_REJECTED,
+                    ]),
+                Tables\Columns\TextColumn::make('created_at')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
+                Tables\Columns\TextColumn::make('updated_at')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
+            ])
+            ->filters([
+                //
+            ])
+            ->actions([
+                Action::make('approve')
+                    ->label('Approve')
+                    ->color('success')
+                    ->visible(function (Document $record) {
+                        $user = auth()->user();
+
+                        if ($record->isTemplateFlow()) {
+                            return
+                                ($user->isManager() && $record->current_stage === Document::STAGE_PENDING_MANAGER) ||
+                                ($user->isHR() && $record->current_stage === Document::STAGE_PENDING_HR);
+                        } elseif ($record->isCustomFlow()) {
+                            $track = $record->approvalTracks()
+                                ->where('approver_id', $user->id)
+                                ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                ->where('status', ApprovalTrack::STATUS_PENDING)
+                                ->first();
+                            return $track !== null;
+                        }
+
+                        return false;
+                    })
+                    ->form([
+                        Forms\Components\Textarea::make('comment')
+                            ->label('Comment')
+                            ->nullable(),
+                    ])
+                    ->action(function (Document $record, array $data) {
+                        $user = auth()->user();
+                        $oldStage = $record->current_stage;
+
+                        if ($record->isTemplateFlow()) {
+                            if ($user->isManager() && $oldStage === Document::STAGE_PENDING_MANAGER) {
+                                ApprovalTrack::create([
+                                    'document_id' => $record->id,
+                                    'approver_id' => $user->id,
+                                    'stage' => $oldStage,
+                                    'status' => ApprovalTrack::STATUS_APPROVED,
+                                    'comment' => $data['comment'] ?? null,
+                                    'action_at' => now(),
+                                ]);
+
+                                $record->update(['current_stage' => Document::STAGE_PENDING_HR]);
+
+                                event(new DocumentStatusChanged(
+                                    document: $record,
+                                    oldStage: $oldStage,
+                                    newStage: Document::STAGE_PENDING_HR,
+                                    approverId: $user->id,
+                                    comment: $data['comment'] ?? null
+                                ));
+                            } elseif ($user->isHR() && $oldStage === Document::STAGE_PENDING_HR) {
+                                ApprovalTrack::create([
+                                    'document_id' => $record->id,
+                                    'approver_id' => $user->id,
+                                    'stage' => $oldStage,
+                                    'status' => ApprovalTrack::STATUS_APPROVED,
+                                    'comment' => $data['comment'] ?? null,
+                                    'action_at' => now(),
+                                ]);
+
+                                $record->update(['current_stage' => Document::STAGE_APPROVED]);
+
+                                event(new DocumentStatusChanged(
+                                    document: $record,
+                                    oldStage: $oldStage,
+                                    newStage: Document::STAGE_APPROVED,
+                                    approverId: $user->id,
+                                    comment: $data['comment'] ?? null
+                                ));
+                            }
+                        } elseif ($record->isCustomFlow()) {
+                            $track = $record->approvalTracks()
+                                ->where('approver_id', $user->id)
+                                ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                ->where('status', ApprovalTrack::STATUS_PENDING)
+                                ->first();
+
+                            if ($track) {
+                                $track->update([
+                                    'status' => ApprovalTrack::STATUS_APPROVED,
+                                    'comment' => $data['comment'] ?? null,
+                                    'action_at' => now(),
+                                ]);
+
+                                $allApproved = $record->approvalTracks()
+                                    ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                    ->where('status', '!=', ApprovalTrack::STATUS_APPROVED)
+                                    ->doesntExist();
+
+                                if ($allApproved) {
+                                    $record->update(['current_stage' => Document::STAGE_APPROVED]);
+
+                                    event(new DocumentStatusChanged(
+                                        document: $record,
+                                        oldStage: $oldStage,
+                                        newStage: Document::STAGE_APPROVED,
+                                        approverId: $user->id,
+                                        comment: $data['comment'] ?? null
+                                    ));
+                                }
+                            }
+                        }
+                    }),
+
+                Action::make('reject')
+                    ->label('Reject')
+                    ->color('danger')
+                    ->visible(function (Document $record) {
+                        $user = auth()->user();
+
+                        if ($record->isTemplateFlow()) {
+                            return
+                                ($user->isManager() && $record->current_stage === Document::STAGE_PENDING_MANAGER) ||
+                                ($user->isHR() && $record->current_stage === Document::STAGE_PENDING_HR);
+                        } elseif ($record->isCustomFlow()) {
+                            $track = $record->approvalTracks()
+                                ->where('approver_id', $user->id)
+                                ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                ->where('status', ApprovalTrack::STATUS_PENDING)
+                                ->first();
+                            return $track !== null;
+                        }
+
+                        return false;
+                    })
+                    ->form([
+                        Forms\Components\Textarea::make('comment')
+                            ->label('Comment')
+                            ->required(),
+                    ])
+                    ->action(function (Document $record, array $data) {
+                        $user = auth()->user();
+                        $oldStage = $record->current_stage;
+
+                        if ($record->isTemplateFlow()) {
+                            ApprovalTrack::create([
+                                'document_id' => $record->id,
+                                'approver_id' => $user->id,
+                                'stage' => $oldStage,
+                                'status' => ApprovalTrack::STATUS_REJECTED,
+                                'comment' => $data['comment'] ?? null,
+                                'action_at' => now(),
+                            ]);
+
+                            $record->update(['current_stage' => Document::STAGE_REJECTED]);
+
+                            event(new DocumentStatusChanged(
+                                document: $record,
+                                oldStage: $oldStage,
+                                newStage: Document::STAGE_REJECTED,
+                                approverId: $user->id,
+                                comment: $data['comment'] ?? null
+                            ));
+                        } elseif ($record->isCustomFlow()) {
+                            $track = $record->approvalTracks()
+                                ->where('approver_id', $user->id)
+                                ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                ->where('status', ApprovalTrack::STATUS_PENDING)
+                                ->first();
+
+                            if ($track) {
+                                $track->update([
+                                    'status' => ApprovalTrack::STATUS_REJECTED,
+                                    'comment' => $data['comment'] ?? null,
+                                    'action_at' => now(),
+                                ]);
+
+                                $anyRejected = $record->approvalTracks()
+                                    ->where('stage', Document::STAGE_PENDING_APPROVERS)
+                                    ->where('status', ApprovalTrack::STATUS_REJECTED)
+                                    ->exists();
+
+                                if ($anyRejected) {
+                                    $record->update(['current_stage' => Document::STAGE_REJECTED]);
+
+                                    event(new DocumentStatusChanged(
+                                    document: $record,
+                                    oldStage: $oldStage,
+                                    newStage: Document::STAGE_REJECTED,
+                                    approverId: $user->id,
+                                    comment: $data['comment'] ?? null
+                                ));
+                                }
+                            }
+                        }
+                    }),
+
+                Tables\Actions\EditAction::make(),
+            ])
+            ->bulkActions([
+                Tables\Actions\BulkActionGroup::make([
+                    Tables\Actions\DeleteBulkAction::make(),
+                ]),
+            ]);
+    }
+
+    public static function getRelations(): array
+    {
+        return [
+            //
+        ];
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => Pages\ListDocuments::route('/'),
+            'create' => Pages\CreateDocument::route('/create'),
+            'edit' => Pages\EditDocument::route('/{record}/edit'),
+        ];
+    }
+}
